@@ -231,3 +231,197 @@ Installed by `nix develop` via git-hooks.nix (ADR-006 — inline Nix, no hand-wr
 | `remote-validated-push` | pre-push (stdin wrapper) | Block release/* pushes without `regression-pass` marker |
 
 NEVER skip with `--no-verify`. NIXIFY_OPERATOR=1 is the only sanctioned bypass (with quoted grant).
+
+---
+
+## 9. nixos-infect + colmena adoption (OCI hosts)
+
+Reference: https://github.com/elitak/nixos-infect — converts a running Ubuntu/Debian/CentOS OCI
+instance to NixOS in-place. This is DESTRUCTIVE to the prior OS by design.
+
+Reference config used for theta (2026-07-09): `references/theta-configuration.nix`
+
+### Preflight checklist (run as `ssh ubuntu@<host>`)
+
+| Check | Command | Expected |
+|---|---|---|
+| Architecture | `uname -m` | `x86_64` or `aarch64` |
+| RAM | `free -h` | ≥1 GB (add swap if exactly 1 GB — see below) |
+| Disk | `df -h /` | ≥10 GB free |
+| EFI vs BIOS | `[ -d /sys/firmware/efi ] && echo UEFI || echo BIOS` | sets grub config |
+| NOPASSWD sudo | `sudo -n true && echo OK` | must be `OK` — if needs password, STOP |
+| Root authorized_keys | `sudo cat /root/.ssh/authorized_keys` | OCI adds forced-command; infect reads ubuntu user keys instead |
+| Network interface | `ip -4 addr` | note interface name (ens3/eth0); needed if DHCP not auto |
+| /etc/nixos exists? | `ls /etc/nixos/` | if present, infect SKIPS makeConf and uses existing files |
+
+### Root-cause of prior theta brick
+
+The previous infect ran with the stock auto-generated `configuration.nix`. The generated file
+only copies SSH keys from the current user's `authorized_keys` into
+`users.users.root.openssh.authorizedKeys.keys`, but OCI's root `authorized_keys` contains
+`forced-command` restrictions that block login ("Please login as the user ubuntu"). After reboot
+to NixOS, `root` had these restricted keys. Ubuntu user does not exist in NixOS. Result: SSH
+lockout with no recovery path short of console/reinstall.
+
+**Fix**: always provide a custom `oracle-override.nix` that explicitly defines all required users
+(root, ryzengrind, nixbuilder) with clean keys and no forced-command.
+
+### Custom config requirements for OCI hosts
+
+All of the following MUST be present in the custom overlay file (e.g. `oracle-override.nix`):
+
+1. `users.users.root.openssh.authorizedKeys.keys` — operator pubkeys WITHOUT forced-command prefix
+2. `users.users.ryzengrind` — isNormalUser=true, wheel, same operator keys
+3. `users.users.nixbuilder` — isNormalUser=true, group=nixbuilder, remote-builder key
+4. `users.groups.nixbuilder = {}; users.groups.ryzengrind = {};` — groups before users
+5. `security.sudo.wheelNeedsPassword = lib.mkForce false;`
+6. `services.openssh.settings.PermitRootLogin = "prohibit-password"` (via oracle-cloud.nix module)
+7. `services.openssh.settings.PasswordAuthentication = false` (via oracle-cloud.nix module)
+8. `networking.firewall.allowedTCPPorts = [ 22 ]` (via oracle-cloud.nix module)
+9. `services.tailscale.enable = true` — package only; enrollment needs operator authkey
+10. `nix.settings.experimental-features = [ "nix-command" "flakes" ]`
+11. `system.stateVersion = lib.mkForce "<channel-version>"` — must match `NIX_CHANNEL`
+
+### Swap requirement on 1 GB shapes
+
+1 GB RAM is insufficient for the NixOS closure build. Add swap before running infect:
+
+```bash
+# If no swap exists:
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+free -h  # verify Swap: 2.0G
+```
+
+nixos-infect itself creates a 1 GB swap at `/tmp/nixos-infect.*.swp` — but only after Nix is
+installed. The channel unpack step (nix-env on nixexprs.tar.xz) can OOM before that swap
+appears. Pre-adding 2 GB eliminates this race.
+
+### NIXOS_IMPORT mechanism
+
+nixos-infect generates `/etc/nixos/configuration.nix` and imports `$NIXOS_IMPORT` inside it:
+
+```bash
+# nixos-infect generated configuration.nix structure:
+{ ... }: {
+  imports = [
+    ./hardware-configuration.nix
+    $NIXOS_IMPORT   # ← your file goes here
+  ];
+  # ... auto-detected: hostName, sshKeys, zramSwap, stateVersion ...
+}
+```
+
+**If `/etc/nixos/configuration.nix` already exists** (e.g. from a prior infect attempt),
+infect's `makeConf()` returns immediately without regenerating — your existing files are used
+as-is. In this case, edit the files directly on the host before re-running infect.
+
+**Recommended pattern**: stage all custom files on the host, then run infect:
+
+```bash
+# Stage custom files
+sudo tee /etc/nixos/oracle-override.nix > /dev/null < oracle-override.nix
+sudo tee /etc/nixos/oracle-cloud.nix > /dev/null < oracle-cloud.nix
+# (or fetch from beta: ssh pbeta 'sudo cat /etc/nixos/oracle-cloud.nix' | ssh ubuntu@theta 'sudo tee /etc/nixos/oracle-cloud.nix')
+
+# Run infect — ALWAYS inside nohup/tmux to survive SSH disconnect
+sudo -i nohup bash -c \
+  'NIX_CHANNEL=nixos-25.05 bash <(curl --fail -L https://raw.githubusercontent.com/elitak/nixos-infect/master/nixos-infect) > /tmp/infect.log 2>&1' &
+```
+
+If using `NIXOS_IMPORT` instead (no pre-existing config):
+```bash
+NIXOS_IMPORT=/etc/nixos/oracle-override.nix \
+NIX_CHANNEL=nixos-25.05 \
+  bash <(curl --fail -L https://raw.githubusercontent.com/elitak/nixos-infect/master/nixos-infect)
+```
+
+### Infect safety: build-before-overwrite guarantee
+
+nixos-infect runs `nix-env -A system` to build the NixOS closure BEFORE overwriting the
+bootloader or filesystem. If the build fails, it aborts and the host remains on Ubuntu —
+safe to retry. A failed infect is always recoverable; a successful infect that reboots into
+a broken config is not.
+
+### Post-infect host-key rotation
+
+nixos-infect generates new SSH host keys. Any SSH client that cached the old Ubuntu host key
+will see a host-key mismatch on reconnect:
+
+```
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+REMOTE HOST IDENTIFICATION HAS CHANGED!
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+```
+
+**To reconnect safely** (use a scratch known_hosts to avoid polluting `~/.ssh/known_hosts`):
+
+```bash
+ssh -o UserKnownHostsFile=/tmp/theta-kh \
+    -o StrictHostKeyChecking=accept-new \
+    root@40.233.87.229 'hostname && nixos-version'
+```
+
+After verifying the host fingerprint, update `~/.ssh/known_hosts` by removing the old line
+for `40.233.87.229` and adding the new one.
+
+### Polling post-reboot (up to 10 min)
+
+```bash
+# Poll every 30s until SSH responds (host reboots automatically at end of infect):
+until ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+          -o UserKnownHostsFile=/tmp/theta-kh \
+          root@40.233.87.229 'hostname && nixos-version && id ryzengrind && id nixbuilder' 2>/dev/null; do
+  echo "$(date): waiting for theta..."
+  sleep 30
+done
+```
+
+Expected output after successful infect:
+```
+theta
+25.05.XXXXXX (NixOS)
+uid=1000(ryzengrind) gid=100(users) groups=100(users),1(wheel)
+uid=1001(nixbuilder) gid=1001(nixbuilder) groups=1001(nixbuilder),1(wheel)
+```
+
+### Adopting an infected host into colmena
+
+After successful infect, adopt theta into `cells/hosts/` following the beta pattern:
+
+1. **Add host cell** — `cells/hosts/nixosConfigurations/theta.nix` importing the same module
+   chain (`oracle-cloud.nix`, `oracle-override.nix`, hardware-configuration.nix).
+2. **Colmena target** — in `flake.nix` or `colmena.nix`:
+   ```nix
+   theta = {
+     deployment = {
+       targetHost = "40.233.87.229";  # or tailscale IP once enrolled
+       buildOnTarget = false;          # always false — build on ws
+       tags = [ "oci-x86_64" ];
+     };
+     imports = [ ./cells/hosts/nixosConfigurations/theta.nix ];
+   };
+   ```
+3. **Build-on-ws only** — `buildOnTarget = false` is mandatory; theta has 1 GB RAM,
+   insufficient for NixOS eval+build.
+4. **Validate** — `NIXIFY_BUILD_HOST=ws validate-host theta` (builds on ws, activates on theta).
+5. **Release** — `release-host theta` after validate-host stamps `regression-pass` marker.
+6. **Tailscale enrollment** — operator runs `sudo tailscale up --authkey=<tskey>` on theta
+   console after adoption; update `deployment.targetHost` to the tailscale IP for air-gapped
+   cluster access.
+
+### Infect monitoring pattern
+
+The infect build takes 5–15 min on a 1 GB/2 vCPU shape. Monitor without blocking:
+
+```bash
+# From local machine — non-blocking tail:
+ssh ubuntu@ptheta 'sudo tail -f /tmp/infect.log' &
+
+# Key log milestones:
+# "unpacking 1 channels..."   → nix-channel update phase (slow, ~2–5 min)
+# "building the system..."    → nix-env -A system (main closure build, ~5–10 min)
+# "finalizing the installation" → bootloader install + reboot pending
+```
